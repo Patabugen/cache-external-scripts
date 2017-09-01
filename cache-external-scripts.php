@@ -42,6 +42,9 @@ class CacheExternalScripts {
 		add_action( 'wp', array( $this, 'setup_cron' ) );
 		add_action( 'admin_menu', array( $this, 'add_admin_menu' ) );
 		add_action( 'admin_init', array( $this, 'settings_init' ) );
+		if ( ! is_admin() ) {
+			add_filter( 'script_loader_src', array( $this, 'cache_script_loader_src' ) );
+		}
 		add_action( 'referesh_external_script_cache', array( $this, 'referesh_external_script_cache' ) );
 		if ( WP_DEBUG ) {
 			add_action( 'wp_footer', array( $this, 'output_debug' ), 999999 );
@@ -158,7 +161,19 @@ class CacheExternalScripts {
 	 * @return string absolute path.
 	 */
 	public function get_cached_script_path( $script ) {
-		return $this->upload_base_dir . '/cached-scripts/' . $script['basename'];
+		return $this->upload_base_dir . '/cached-scripts/' . $this->get_script_basename( $script );
+	}
+
+	/**
+	 * Get the path which should point to a cached script (whether it's been cached
+	 * locally or not)
+	 *
+	 * @param  array $script Array including the key 'basename'.
+	 *
+	 * @return string absolute path.
+	 */
+	public function get_cached_script_url( $script ) {
+		return $this->upload_base_url . '/cached-scripts/' . $this->get_script_basename( $script );
 	}
 
 	/**
@@ -189,15 +204,62 @@ class CacheExternalScripts {
 	 * Update the locally cached files
 	 */
 	public function referesh_external_script_cache() {
-		foreach( $this->get_scripts_to_cache() as $index => $script ) {
+		foreach ( $this->get_scripts_to_cache() as $index => $script ) {
 			$this->cache_script( $script );
 		}
 	}
 
 	/**
+	 * Filters script_loader_src and replaces external script URLs with locally
+	 * cached ones if requried.
+	 *
+	 * @param string $src Script URL
+	 *
+	 * @return string Script URL - either the original or the new, local one.
+	 */
+	public function cache_script_loader_src( $src ) {
+		if ( $this->src_should_be_cached( $src ) ) {
+			// Since we only have the URL here, create a mini mock
+			// script for our script loving objects.
+			$script = array(
+				'external_url' => $src,
+				'basename' => $this->get_script_basename( $src ),
+			);
+			$this->cache_script( $script );
+			return $this->get_cached_script_url( $script );
+		}
+		return $src;
+	}
+
+
+	/**
+	 * Given a URL, see if it's one which we should cache locally. This is for
+	 * processing URLs added with wp_enqueue_script
+	 *
+	 * @param string $src The URL to check.
+	 *
+	 * @return boolean True if we should be caching this URL, false otherwise.
+	 */
+	public function src_should_be_cached( $src ) {
+		// We only cache absolute URLs.
+		if ( substr( $src, 0, 4 ) !== 'http' ) {
+			return false;
+		}
+		foreach ( $this->get_scripts_to_cache() as $script ) {
+			if ( isset( $script['script_loader_src_regex'] ) ) {
+				if ( preg_match( $script['script_loader_src_regex'], $src ) ) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * Get a list of scripts which need caching, along with useful information about them.
 	 *
-	 * @return [type] [description]
+	 * @return array Assosiative array of scripts to cache with a slug as an index and
+	 *               another array with bits of information as the values.
 	 */
 	public function get_scripts_to_cache() {
 		$defaults = array(
@@ -215,16 +277,53 @@ class CacheExternalScripts {
 					'replacement' => '{local_url}',
 				),
 			),
+			'share_this' => array(
+				'script_loader_src_regex' => '#sharethis.com#',
+			),
 		);
 		$scripts = apply_filters( 'cache_external_scripts_list', $defaults );
-		// Check the scripts, and fill in any unset defaults.
-		foreach ( $scripts as $slug => $script ) {
-			if ( ! isset( $script['basename'] ) ) {
-				$path = wp_parse_url( $script['external_url'], PHP_URL_PATH );
-				$scripts[ $slug ]['basename'] = basename( $path );
-			}
-		}
 		return $scripts;
+	}
+
+	/**
+	 * Calculate the basename for a script based on as much info as possible.
+	 *
+	 * @param mixed $script Array containing as many keys as possible to identiy
+	 *                      the script. The $script is read by reference and a
+	 *                      basename key will be added if it doesn't exist. If a
+	 *                      string is given then a basename will be returned as
+	 *                      as string.
+	 *
+	 *
+	 * @return string The basename for the script (e.g. analytics.js )
+	 */
+	public function get_script_basename( &$script, $slug = false ) {
+		if ( isset( $script['basename'] ) ) {
+			return $script['basename'];
+		}
+		// If we've been given a string, turn it into an array and call
+		// ourself.
+		if ( is_string($script) ) {
+			$script = array(
+				'external_url' => $script,
+			);
+			return $this->get_script_basename($script);
+		}
+
+		// Bit of a long one here. If we have an external_url, and are able to parse to get
+		// a path out of it - then use that path.
+		if (
+			isset( $script['external_url'] )
+			&& ! empty( $path = wp_parse_url( $script['external_url'], PHP_URL_PATH ) )
+			&& ! empty ( $basename = basename( $path ) )
+		) {
+			$script['basename'] = $basename;
+		} elseif ( ! empty( $slug ) ) {
+			$script['basename'] = $slug . '.js';
+		} else {
+			$script['basename'] =  crc32( $script['external_url'] ) . '.js';
+		}
+		return $script['basename'];
 	}
 
 	/**
@@ -256,7 +355,7 @@ class CacheExternalScripts {
 		echo '<ul>';
 		foreach ( $this->get_scripts_to_cache() as $script ) {
 			echo '<li>';
-			echo esc_html( $script['basename'] ) . ' : ';
+			echo esc_html( $this->get_script_basename( $script ) ) . ' : ';
 			if ( $this->script_is_cached( $script ) ) {
 				$time_since_update = time() - filemtime( $this->get_cached_script_path( $script ) );
 				echo 'Last Updated: ' . esc_html( round( $time_since_update / 60) ) . ' minutes ago';
